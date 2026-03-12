@@ -1,8 +1,11 @@
 import os
 import json
+import sqlite3
 from pathlib import Path
 from typing import Optional
 from io import BytesIO
+from datetime import datetime
+from uuid import uuid4
 
 import torch
 import torch.nn as nn
@@ -29,6 +32,8 @@ CLASS_MAP_PATH = os.getenv('CLASS_MAP_PATH', 'outputs/class_to_idx.json')
 MODEL_NAME = os.getenv('MODEL_NAME', 'resnet18').lower()
 IMG_SIZE = int(os.getenv('IMG_SIZE', '224'))
 TOP_K = int(os.getenv('TOP_K', '3'))
+UPLOAD_DIR = os.getenv('UPLOAD_DIR', 'upload')
+SQLITE_DB_PATH = os.getenv('SQLITE_DB_PATH', 'database/app.db')
 
 app = FastAPI(
     title="DeerAge - Jawbone Age Classification API",
@@ -52,6 +57,9 @@ STATIC_DIR = SCRIPT_DIR / "static"
 # Mount static files if the directory exists
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+if Path(UPLOAD_DIR).exists():
+    app.mount("/upload", StaticFiles(directory=UPLOAD_DIR), name="upload")
 
 # Age class metadata for reliability assessment
 # Scientific characteristics based on tooth replacement and wear patterns
@@ -158,6 +166,127 @@ def load_model(checkpoint_path: str, num_classes: int, model_name: str):
     return model
 
 
+def init_database(db_path: str):
+    db_file = Path(db_path)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(str(db_file)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usermail TEXT,
+                created_at TEXT NOT NULL,
+                original_filename TEXT,
+                saved_filename TEXT,
+                saved_image_path TEXT,
+                age_estimate TEXT,
+                confidence REAL,
+                reliability TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+def save_prediction_result(
+    db_path: str,
+    usermail: str,
+    original_filename: str,
+    saved_filename: str,
+    saved_image_path: str,
+    response_payload: dict,
+):
+    prediction = response_payload.get("prediction", {})
+    created_at = datetime.utcnow().isoformat(timespec='seconds') + "Z"
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO predictions (
+                created_at,
+                usermail,
+                original_filename,
+                saved_filename,
+                saved_image_path,
+                age_estimate,
+                confidence,
+                reliability
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                created_at,
+                usermail,
+                original_filename,
+                saved_filename,
+                saved_image_path,
+                prediction.get("age_estimate"),
+                prediction.get("confidence"),
+                prediction.get("reliability")
+            ),
+        )
+        conn.commit()
+
+
+def to_upload_url(saved_image_path: Optional[str]) -> Optional[str]:
+    if not saved_image_path:
+        return None
+
+    normalized = saved_image_path.replace("\\", "/")
+    if normalized.startswith("upload/"):
+        return f"/{normalized}"
+    if normalized.startswith("/upload/"):
+        return normalized
+
+    upload_index = normalized.find("/upload/")
+    if upload_index >= 0:
+        return normalized[upload_index:]
+
+    return None
+
+
+def get_prediction_history_by_usermail(db_path: str, usermail: str):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                usermail,
+                created_at,
+                original_filename,
+                saved_filename,
+                saved_image_path,
+                age_estimate,
+                confidence,
+                reliability
+            FROM predictions
+            WHERE lower(usermail) = lower(?)
+            ORDER BY created_at DESC, id DESC
+            """,
+            (usermail,),
+        ).fetchall()
+
+    history = []
+    for row in rows:
+        history.append({
+            "id": row["id"],
+            "usermail": row["usermail"],
+            "created_at": row["created_at"],
+            "original_filename": row["original_filename"],
+            "saved_filename": row["saved_filename"],
+            "saved_image_path": row["saved_image_path"],
+            "saved_image_url": to_upload_url(row["saved_image_path"]),
+            "prediction": {
+                "age_estimate": row["age_estimate"],
+                "confidence": row["confidence"],
+                "reliability": row["reliability"],
+            },
+        })
+
+    return history
+
+
 @app.on_event("startup")
 def startup_event():
     global model, idx_to_class, tfm, device
@@ -174,6 +303,7 @@ def startup_event():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = load_model(CHECKPOINT_PATH, num_classes=len(idx_to_class), model_name=MODEL_NAME).to(device)
     tfm = build_transform(IMG_SIZE)
+    init_database(SQLITE_DB_PATH)
 
 
 @app.get('/', response_class=HTMLResponse)
@@ -206,8 +336,22 @@ async def get_age_classes():
     })
 
 
+@app.get('/history')
+async def get_history(usermail: str):
+    usermail = usermail.strip()
+    if not usermail:
+        raise HTTPException(status_code=400, detail="Query parameter 'usermail' is required")
+
+    history = get_prediction_history_by_usermail(SQLITE_DB_PATH, usermail)
+    return JSONResponse(content={
+        "usermail": usermail,
+        "count": len(history),
+        "history": history,
+    })
+
+
 @app.post('/predict')
-async def predict(file: UploadFile = File(...)):
+async def predict(file: UploadFile = File(...), usermail: Optional[str] = None):
     """
     Predict deer age from jawbone image.
 
@@ -223,6 +367,19 @@ async def predict(file: UploadFile = File(...)):
     except Exception:
         await file.seek(0)
         image = Image.open(file.file).convert('RGB')
+
+    # Create date-named directory in upload folder
+    current_date = datetime.now().strftime('%Y-%m')
+    date_folder = Path(UPLOAD_DIR) / current_date
+    date_folder.mkdir(parents=True, exist_ok=True)
+
+    # Save the uploaded image with a random filename
+    suffix = Path(file.filename).suffix.lower() if file.filename else ''
+    if not suffix:
+        suffix = '.jpg'
+    random_filename = f"{uuid4().hex}{suffix}"
+    image_path = date_folder / random_filename
+    image.save(str(image_path))
 
     x = tfm(image).unsqueeze(0).to(device)
     with torch.no_grad():
@@ -277,5 +434,14 @@ async def predict(file: UploadFile = File(...)):
 
     if warnings:
         response["warnings"] = warnings
+
+    save_prediction_result(
+        db_path=SQLITE_DB_PATH,
+        usermail=usermail,
+        original_filename=file.filename,
+        saved_filename=random_filename,
+        saved_image_path=str(image_path),
+        response_payload=response,
+    )
 
     return JSONResponse(content=response)
